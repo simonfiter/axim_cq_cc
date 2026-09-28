@@ -228,8 +228,9 @@ module axim2s
         {{(AXIS_PCIE_DATA_WIDTH-128){1'b0}}, cq_descriptor} :
         (state == ST_CQ_DATA) ? write_data[send_count[4:0]] :
         {AXIS_PCIE_DATA_WIDTH{1'b0}};
-    assign axis_cq_tkeep = (state == ST_CQ_HEADER && !req_write) ?
-        8'h0f : 8'hff;
+    // In address-aligned mode the descriptor owns only the low four DW lanes;
+    // the high four lanes are padding for both reads and writes.
+    assign axis_cq_tkeep = (state == ST_CQ_HEADER) ? 8'h0f : 8'hff;
     assign axis_cq_tlast = (state == ST_CQ_HEADER && !req_write) ||
         (state == ST_CQ_DATA && send_count == req_len[5:0]);
     assign axis_cq_tuser = cq_user;
