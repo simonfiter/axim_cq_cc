@@ -1,23 +1,23 @@
-# AXI Manager ↔ PCIe CQ/CC Bridge 开发规格（待确认）
+# AXI Manager ↔ PCIe CQ/CC Bridge 开发规格
 
-状态：首版实现约定已确认；后续扩展范围见第 5 节。
+状态：按用户修正后的顶层接口及“没问题就开始 RTL 开发”的授权实现首版；尚未执行编译、仿真或其他验证。后续扩展范围见第 5 节。
 
 ## 1. 目标与边界
 
-在 `rtl/axim_cq_cc.v` 的现有 `axim2s` 顶层中，实现从 AXI Manager AW/W/AR 到 CQ 请求包、从 CC 完成包到 AXI B/R 响应的桥接。使用可综合 Verilog。保持顶层模块名、参数列表和端口列表原样；只修改实现所需的 RTL，并增加必要的验证文件。
+在 `rtl/axim_cq_cc.v` 的现有 `axim2s` 顶层中，实现从 AXI Manager AW/W/AR 到 CQ 请求包、从 CC 完成包到 AXI B/R 响应的桥接。使用可综合 Verilog。保持用户修正后的顶层模块名、参数列表和端口列表原样；本阶段仅修改 RTL 及开发规格，不修改验证文件。
 
 本模块的 CQ 是输出，CC 是输入。`aclk` 为全部通道的时钟，`aresetn` 为低有效复位。所有 ready/valid 传输仅在同一时钟沿同时为 1 时发生。
 
 依据：`README.md`、`Agent.md`、`signal_describ/axi_master_signal.md`、`signal_describ/stream_cq_cc.md`、`operation_describ/axis_compelet/axi_stream_complete.md` 及现有顶层。
 
-## 2. 拟采用的架构
+## 2. 实现架构
 
 ### 2.1 请求接收与仲裁
 
 - AW 控制信息、W 数据和 AR 控制信息分别握手。AW 与 W 可在不同周期到达；不能假定 W 连续有效。
 - 写通道先保存 AW 及该请求的完整 W 数据，再开始输出 CQ 包。这样在 CQ 包开始后，即使 AXI W 暂停，也能保持 CQ `tvalid` 连续及各拍内容稳定。
 - 读通道保存 AR 信息。读写请求在 CQ 出口仲裁；一个 CQ 包从首拍至 `tlast` 握手结束期间不能被另一请求插入。
-- 建议首版采用全局一次只处理一笔 AXI 请求的顺序架构。AW/W 与 AR 同时出现时，采用固定且不会饿死一方的轮换仲裁。此限制降低 ID/Tag 跟踪与拆分完成包的复杂度，但会限制吞吐率，需确认。
+- 首版采用全局一次只处理一笔 AXI 请求的顺序架构。AW 或 W 与 AR 同时出现时，采用轮换仲裁，复位后写优先；写响应完成后读优先，读响应完成后写优先。W 先到时占用写事务槽并等待 AW；读写事务均在最后一拍 B/R 握手后释放槽位。因此公平性要求上游最终补齐已接受的事务，且下游最终响应并解除背压。
 - `awready/arready/wready` 只在内部有足够空间且可接受相应事务时拉高。所有已握手数据在复位前或该事务完成前保持有效，不以 `valid` 的后续变化为依据。
 
 ### 2.2 CQ 报文生成
@@ -26,6 +26,8 @@
 - descriptor 字段使用 CQ 文档定义的位位置：地址类型 `[1:0]`、地址 `[63:2]`、DW 数 `[74:64]`、请求类型 `[78:75]`、Requester ID `[95:80]`、Tag `[103:96]`、Target Function `[111:104]`、TC `[123:121]`、属性 `[126:124]`。本阶段请求类型只产生 Memory Read (`0000`) 和 Memory Write (`0001`)。未定义或保留字段置零；有明确来源的字段从 AXI sideband 提取。
 - CQ Tag `[103:96]` 取 `mstr_*misc_info[47:40]`，直接丢弃 `[49:48]`。接收 CC 时按低 8 bit Tag 校验；在全局单笔在途架构下，高 2 bit 不参与请求匹配。
 - 第一拍 `tuser[3:0]` / `[7:4]` 为 first/last byte enable；`tuser[39:8]` 为当前拍 payload 字节有效标志；`tuser[40]` 为 SOP；`tuser[42]`、`[44:43]`、`[52:45]` 为 TPH 信息。首版不启用 parity 校验，CQ parity 和 `discontinue` 置零。
+- address-aligned 写请求的 descriptor 独占首拍，首拍高 128 bit 是对齐填充，`tkeep=8'hff`、payload byte enable 为零；后续整拍 payload 的 `tkeep=8'hff`。读请求只有 descriptor，`tkeep=8'h0f`、`tlast=1`。首尾 BE 及 TPH 仅首拍有效，其余拍置零。
+- Requester ID、Tag、BAR ID、TC、NS/RO 分别来自 `misc_info[39:24]`、`[47:40]`、`[8:6]`、`[18:16]`、`[14]`/`[15]`；ROM 标志 `[10]` 为 1 时 BAR ID 为 6。AT 来自 `*_ats`，IDO 来自 `*_ido`。BAR Aperture 无输入来源，置零。
 - 首版写请求要求每拍 `mstr_wstrb=32'hffff_ffff`，因此 CQ 首尾 BE 均为 `4'hf`，每个 payload 拍的 32 位 `byte_en` 全为 1。非连续 strobe 和零长度写属于后续扩展。
 - CQ `tvalid && !tready` 时，`tdata/tkeep/tlast/tuser/tvalid` 必须保持不变；已经开始的包不能因为输入 AXI 暂停而出现无效拍。
 
@@ -34,17 +36,19 @@
 - 从 CC 前 96 bit 解析 completion descriptor，包括 Lower Address `[6:0]`、Byte Count `[28:16]`、DW Count `[42:32]`、Completion Status `[45:43]`、Requester ID `[63:48]`、Tag `[71:64]`。按 `tkeep/tlast` 确定完整包，去掉 descriptor 与对齐填充后将 payload 转为 AXI R 数据。
 - 利用保存的请求上下文关联 Completion 与原始 AXI ID。Memory Read Completion 产生 R；一个读请求的多个 Split Completions 按 Byte Count/DW Count/Lower Address 顺序拼接，直到满足原请求，才产生最后一个 `mstr_rlast`。
 - AXI B/R 在 `valid && !ready` 时保持 ID、数据、状态、`last` 和 sideband 稳定。CC 接收侧的缓冲空间不足时拉低 `axis_cc_tready`，不能丢包。
+- 读路径使用 256 DW 的整请求缓存，全部 Split Completion 接收完毕后才输出 R。每个 CC 包从 descriptor 后一拍开始接收 payload，第一 payload 拍跳过 `Lower Address[4:2]` 指定的填充 DW；各包数据紧密拼接到缓存。每个 DW 保存该包的 EP，输出 AXI 拍内任一 DW 带 EP 时令 `rmisc_info[7]=1`，其余位为零。缓存无需复位，只有完整写入后才向 AXI 输出。
 - Memory Write 按 Posted 请求处理；在对应 CQ 包最后一拍握手后产生 AXI B，`bresp=OKAY`、`bmisc_info_cpl_stat=SC`。本阶段不生成 I/O、配置或其他非 Posted 写请求。
 - PCIe Completion Status 与 AXI `bresp/rresp`、`*_misc_info_cpl_stat` 的映射单独明确；不能直接把 PCIe 3-bit 状态截成 AXI 2-bit 响应。
+- SC (`000`) → OKAY (`00`)，UR (`001`) → DECERR (`11`)，CA (`100`) → SLVERR (`10`)；响应 sideband 保留 Completion Status。UR/CA 包剩余内容（包括请求日志字段）丢弃到 `tlast`，随后返回原请求 LEN+1 拍零数据，最后一拍 RLAST。若后续 split 报错，也对整笔读请求返回该错误，不暴露此前缓存的数据。
 
-## 3. 拟支持范围与参数
+## 3. 支持范围与参数
 
 | 项目 | 建议首版规格 | 确认状态 |
 | --- | --- | --- |
 | AXI 请求类型 | 仅 Memory Read、Memory Write | 已确认 |
 | AXI/CQ/CC 宽度 | 默认 256/256 bit，`WSTRB=32`、`TKEEP=8` | 已确认首版范围 |
 | 对齐模式 | CQ/CC 均采用 address-aligned | 已确认 |
-| 并发数 | 全局最多一笔尚未完成的 AXI 请求 | 待确认性能要求 |
+| 并发数 | 全局最多一笔尚未完成的 AXI 请求 | 本次按提出的首版架构实现 |
 | AXI burst | `mstr_awlen/mstr_arlen` 均为“传输拍数减一”，实际拍数为 LEN+1 | 已确认；与信号说明中的“实际拍数”表述不一致，以本项目约定为准 |
 | 事务长度 | 单笔请求不超过 256 DW；大于 256 DW 的请求由上游拆分后再送入本模块 | 已确认；单笔上限是输入契约 |
 | CQ Tag | `mstr_*misc_info[47:40]`；`[49:48]` 截断 | 已确认 |
@@ -72,3 +76,15 @@
 2. **Target Function 分配**：CQ 文档的示例只列出 4 个 PF 和 4 个 VF。本项目首版按顶层实际配置划分 8-bit 空间：PF0..PF7 使用 0..7；VF0..VF247 使用 8..255。`vfunc_active=1` 时将 `8 + vfunc_num` 写入 CQ `[111:104]`，否则使用 `func_num`。`vfunc_num>247` 时 AW/AR 暂不握手。其他没有可用映射的字段置零。Tag 只取低 8 bit。
 3. **错误与异常**：首版按 CC descriptor 中 SC/UR/CA 状态输出 AXI OKAY/DECERR/SLVERR，RRS、discontinue 和 parity 错误的系统级恢复策略未定义；需要扩展时另行确认。
 4. **Split Completion**：同一读请求可由多个按顺序到达的 CC 包完成；用 Byte Count 判断剩余数据。首版要求这些包的有效数据合计等于原 AR 请求字节数。
+
+## 6. 实现约束与交付状态
+
+- 输入为 Memory 类型（`misc_info[23:19]=0`、I/O 标志 `[9]=0`）的 INCR burst，LEN≤31、SIZE=5、地址低 5 bit 为零。地址通道仅对这些请求及有效 VF 编号握手；零长度读不握手。单笔请求不得跨越 AXI 规定的 4 KiB 边界，上游负责拆分。其它输入不属于首版契约。
+- W 可先于 AW 接收，最多缓存 32 拍。一旦接收 WLAST，不再接收本事务的 W；AW 到达并收齐数据后检查拍数及 WLAST。非全一 WSTRB、提前 WLAST、到达期望拍数仍无 WLAST，返回 SLVERR/CA，不发送 CQ；缺失 AW 或缺失预期 W 数据时继续等待，不提供超时机制。
+- CC 按 Requester ID 和低 8-bit Tag 匹配。无关完成包丢弃到 TLAST，然后继续等待当前请求，不产生 AXI 响应。
+- SC 包检查 descriptor keep、Byte Count、Lower Address、DW Count、payload keep 和 TLAST 边界。格式不一致时排空该包，整笔读返回 SLVERR/CA 和零数据。其它未定义 Completion Status 保留状态 sideband 并映射为 SLVERR；不承诺系统级错误恢复。
+- 首版 Split Completion 的起始地址及长度必须按 DW 对齐；Byte Count 等于当前请求剩余字节数，Lower Address 等于下一有效数据地址的低 7 bit。允许 split 边界位于 AXI 拍内部。
+- `*_hdr_34dw`、`*_fmt`、`*_dwlen`、`*_last_dcmp_tlp`、`*_nw`、写 EP、AXI lock/qos/cache/prot 不参与首版报文转换。请求大小由 LEN+1 与 SIZE 契约确定，不能利用这些字段扩展为其它报文类型。
+- CC parity 不检查；discontinue 不参与首版恢复处理，要求输入不发生 discontinue。CQ parity 固定为零。外部需关闭 parity 检查。
+- 顶层 `mstr_bresp` 原样保留，集成环境必须提供 `CC_AXIJ_DMWR_VALUE` 宏定义；标准两位响应在开启额外 DMWR 位时零扩展。
+- RTL 已写入；按照用户要求，本阶段没有新增或运行验证平台、编译、lint、综合或仿真。功能正确性及综合结果仍待验证环节确认。
