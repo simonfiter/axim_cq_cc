@@ -145,10 +145,12 @@ module axim_alignment_tb;
         reg [255:0] expected_data;
         reg [31:0] expected_byte_en;
         reg [7:0] expected_keep;
+        reg [349:0] held_cq;
         integer beat, lane, offset, source, count;
         begin
             $display("WRITE addr=%h len=%0d", addr, len);
             @(negedge aclk);
+            axis_cq_tready = 0;
             mstr_awaddr = addr;
             mstr_awlen = len;
             mstr_awvalid = 1;
@@ -164,20 +166,33 @@ module axim_alignment_tb;
                 send_w(data[beat], strb[beat], beat == len);
             end
             $display("W accepted at %0t", $time);
-            do @(posedge aclk); while (!axis_cq_tvalid);
-            if (axis_cq_tdata[74:64] !== dw_count ||
-                axis_cq_tdata[63:2] !== addr[63:2] ||
-                axis_cq_tkeep !== 8'hff || axis_cq_tuser[7:0] !== be ||
-                axis_cq_tdata[255:128] !== 0 || axis_cq_tlast ||
-                !axis_cq_tuser[40] || axis_cq_tuser[39:8] !== 0)
-                $fatal(1, "address-aligned CQ write descriptor mismatch");
             offset = 0;
             while (offset < dw_count) begin
+                do @(negedge aclk); while (!axis_cq_tvalid);
+                held_cq = {axis_cq_tdata, axis_cq_tkeep, axis_cq_tuser,
+                           axis_cq_tlast};
+                repeat (2) begin
+                    @(posedge aclk);
+                    if (!axis_cq_tvalid ||
+                        {axis_cq_tdata, axis_cq_tkeep, axis_cq_tuser,
+                         axis_cq_tlast} !== held_cq || mstr_bvalid)
+                        $fatal(1, "CQ changed or B asserted before stalled write completed");
+                end
+                @(negedge aclk);
+                axis_cq_tready = 1;
+                @(posedge aclk);
+                if (offset == 0 &&
+                    (axis_cq_tdata[74:64] !== dw_count ||
+                     axis_cq_tdata[63:2] !== addr[63:2] ||
+                     axis_cq_tdata[78:75] !== 4'b0001))
+                    $fatal(1, "Dword-aligned CQ write descriptor mismatch");
                 expected_data = 0;
+                if (offset == 0)
+                    expected_data[127:0] = axis_cq_tdata[127:0];
                 expected_byte_en = 0;
-                expected_keep = offset == 0 ? 8'h01 : 0;
+                expected_keep = offset == 0 ? 8'h0f : 0;
                 count = 0;
-                for (lane = (offset == 0 ? 1 : 0); lane < 8; lane = lane + 1) begin
+                for (lane = (offset == 0 ? 4 : 0); lane < 8; lane = lane + 1) begin
                     if (offset + count < dw_count) begin
                         source = addr[4:2] + offset + count;
                         expected_data[lane*32 +: 32] =
@@ -188,16 +203,20 @@ module axim_alignment_tb;
                         count = count + 1;
                     end
                 end
-                @(posedge aclk);
                 if (axis_cq_tvalid !== 1'b1 ||
                     axis_cq_tdata !== expected_data ||
                     axis_cq_tkeep !== expected_keep ||
                     axis_cq_tuser[39:8] !== expected_byte_en ||
-                    axis_cq_tuser[40] || axis_cq_tuser[7:0] !== 0 ||
+                    axis_cq_tuser[40] !== (offset == 0) ||
+                    axis_cq_tuser[7:0] !== (offset == 0 ? be : 8'h00) ||
+                    axis_cq_tuser[41] !== 1'b0 ||
                     axis_cq_tlast !== (offset + count == dw_count))
-                    $fatal(1, "address-aligned CQ write payload mismatch");
+                    $fatal(1, "Dword-aligned CQ write payload mismatch");
                 offset = offset + count;
+                @(negedge aclk);
+                axis_cq_tready = 0;
             end
+            axis_cq_tready = 1;
             do @(posedge aclk); while (!mstr_bvalid);
             $display("B at %0t", $time);
             if (mstr_bresp !== 2'b00)
@@ -370,10 +389,18 @@ module axim_alignment_tb;
                     11'd3, 8'h3f);
         check_write(64'h103f, 0, 32'h8000_0000, 0,
                     11'd1, 8'h08);
-        // Seven Dwords fit exactly in the first payload beat; eight spill.
+        // Four Dwords fit in the descriptor beat; the fifth starts lane 0.
+        check_write(64'h1100, 0, 32'h0000_ffff, 0, 11'd4, 8'hff);
+        check_write(64'h1100, 0, 32'h000f_ffff, 0, 11'd5, 8'hff);
         check_write(64'h1100, 0, 32'h0fff_ffff, 0, 11'd7, 8'hff);
         check_write(64'h1100, 0, 32'hffff_ffff, 0, 11'd8, 8'hff);
-        // Figure 26: 7 + 8 + 6 Dwords, ending with keep=0x3f.
+        // Figure 23: 4 + 8 + 1 Dwords, ending with keep=0x01.
+        check_write(64'h1100, 1, 32'hffff_ffff, 32'h000f_ffff,
+                    11'd13, 8'hff);
+        // Exact full continuation beat and one Dword beyond it.
+        check_write(64'h1100, 1, 32'hffff_ffff, 32'h0000_ffff,
+                    11'd12, 8'hff);
+        // 21 Dwords use 4 + 8 + 8 + 1 lanes.
         check_write(64'h1104, 2, 32'hffff_fff0, 32'h00ff_ffff,
                     11'd21, 8'hff);
         check_write(64'h1400, 31, 32'hffff_ffff, 32'hffff_ffff,

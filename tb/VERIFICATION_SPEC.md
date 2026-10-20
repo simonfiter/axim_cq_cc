@@ -46,11 +46,23 @@ The simulation dumps `tmp/axim2s_tb.vcd`.
 | TP11 | UR completion | AXI response is DECERR and completion status is UR |
 | TP12 | CA completion | AXI response is SLVERR and completion status is CA |
 | TP13 | Simultaneous AW and AR | Both free slots accept independently; CQ arbitrates complete packets |
-| TP14 | PF/VF and sideband fields | Target function, Tag, Requester ID, TC, attributes, ATS and TPH decode correctly |
+| TP14 | PF/VF and sideband fields | Target function, 10-bit CQ Tag, Requester ID, TC, attributes, ATS and TPH decode correctly |
 | TP15 | Reset during an incomplete request | Partial context is discarded and a later request succeeds |
 | TP16 | Random regression | Random address, ID, sideband, length, data, gaps and backpressure across multiple transactions |
 
 ## 4. Pass criteria
+
+CQ Tag is reconstructed as `{descriptor[127], descriptor[79], descriptor[103:96]}`
+and compared against AXI `misc_info[49:40]` for both reads and writes. The
+main regression varies Tag[9:8] across 00, 01, 10, and 11 in both directions,
+including CQ stalls and concurrent requests. AXI/CQ transaction logs retain
+all ten Tag bits. CC Tag is reconstructed as `{descriptor[31:30], descriptor[71:64]}`
+and matched against all ten saved request Tag bits, together with Requester ID.
+`check_cc_tag_extension` covers all four matching Tag[9:8] values. For each
+pending read it injects three foreign Tags with identical low eight bits and
+Requester ID, changing Tag[8], Tag[9], or both. Multi-beat SC and single-beat
+UR packets must be discarded without producing R; matching split packets
+must still complete the pending read with the expected data.
 
 All directed and randomized test points must finish without `$fatal`, the
 scoreboard error count must remain zero, and the final banner must be
@@ -68,19 +80,23 @@ iverilog -g2012 -Wall -s axim2s_tb -o tmp\axim2s_tb.vvp rtl\axim_cq_cc.v tb\axim
 vvp tmp\axim2s_tb.vvp
 ```
 
-## 6. CQ payload lane-1 regression
+## 6. CQ Dword-Aligned regression (Figure 23)
 
-The CQ Memory Write payload starts at `tdata[63:32]` in the beat after
-the descriptor, independently of AXI address alignment. Later beats start
-at lane 0. The descriptor uses keep `0xff`, SOP=1 and zero payload byte
-enables; the first payload beat has zero byte enables in lane 0.
+The CQ Memory Write descriptor occupies `tdata[127:0]`; the same beat
+carries up to four payload Dwords in lanes 4..7, independently of AXI address
+alignment. Later beats start at lane 0. The first beat asserts SOP and has
+zero byte enables in descriptor lanes 0..3. Keep covers the descriptor and
+actual payload; writes of up to four Dwords assert TLAST on this first beat.
 
 `axim2s_tb` checks repacked data, byte enables, keep and last under random CQ
-backpressure, including output stability. `axim_alignment_tb` checks 39 writes
-with randomized data: partial first/last Dwords, one-Dword writes, the 7/8-Dword
-boundary, Figure 26's 7+8+6 layout (last keep `0x3f`), a 256-Dword write requiring
-33 payload beats, and all 32 AXI byte offsets with varying burst lengths and
-randomized addresses. Existing aligned, unaligned and split read checks remain.
+backpressure, including output stability. `axim_alignment_tb` checks 43 writes
+with randomized data: partial first/last Dwords, one-Dword writes, the 4/5-Dword
+boundary, an exact 4+8 layout, Figure 23's 4+8+1 layout (last keep `0x01`),
+a 21-Dword 4+8+8+1 layout, a 256-Dword write requiring 33 total CQ beats, and
+all 32 AXI byte offsets with varying burst lengths and randomized addresses.
+Every write CQ beat is stalled for two cycles; outputs must remain stable
+and B must remain deasserted before the final CQ handshake. Existing aligned,
+unaligned and split read checks remain.
 
 Compile each bench with `-g2012 -DCC_AXIJ_DMWR_VALUE=0 -s <bench>` using
 `rtl/axim_cq_cc.v` and `tb/<bench>.sv`, then run the resulting file with `vvp`.

@@ -131,6 +131,7 @@ module axim2s_tb;
         begin
             mstr_awmisc_info = '0;
             mstr_awmisc_info[47:40] = 8'h40 + txn;
+            mstr_awmisc_info[49:48] = txn[1:0];
             mstr_awmisc_info[39:24] = 16'h1200 + txn;
             mstr_awmisc_info[18:16] = txn[2:0];
             mstr_awmisc_info[15:14] = txn[1:0];
@@ -148,6 +149,7 @@ module axim2s_tb;
         begin
             mstr_armisc_info = '0;
             mstr_armisc_info[47:40] = 8'h80 + txn;
+            mstr_armisc_info[49:48] = txn[1:0];
             mstr_armisc_info[39:24] = 16'h3400 + txn;
             mstr_armisc_info[18:16] = txn[2:0];
             mstr_armisc_info[15:14] = txn[1:0];
@@ -207,6 +209,8 @@ module axim2s_tb;
         reg [127:0] desc;
         reg [7:0] expected_function;
         reg [10:0] expected_tph;
+        reg [9:0] expected_tag;
+        integer lane;
         begin
             do @(posedge aclk); while (!(axis_cq_tvalid && axis_cq_tready));
             desc = axis_cq_tdata[127:0];
@@ -214,8 +218,12 @@ module axim2s_tb;
             expected_tph = (is_write ? 11'h155 : 11'h2aa) ^ txn;
             check(axis_cq_tkeep == (is_write ? 8'hff : 8'h0f),
                   "CQ descriptor keep mismatch");
-            check(axis_cq_tdata[255:128] === 128'b0, "CQ descriptor upper lanes mismatch");
-            check(axis_cq_tuser[39:8] === 32'b0, "CQ descriptor payload byte enables must be zero");
+            for (lane = 4; lane < 8; lane = lane + 1)
+                check(axis_cq_tdata[lane*32 +: 32] ===
+                      (is_write ? payload_dw(txn, lane-4) : 32'b0),
+                      "CQ descriptor upper lanes mismatch");
+            check(axis_cq_tuser[39:8] === (is_write ? 32'hffff_0000 : 32'b0),
+                  "CQ descriptor payload byte enables mismatch");
             check(axis_cq_tuser[41] === 1'b0, "CQ descriptor discontinue must be zero");
             check(axis_cq_tuser[40], "CQ descriptor must assert SOP");
             check(axis_cq_tuser[7:0] == 8'hff, "CQ first/last byte enable mismatch");
@@ -225,7 +233,10 @@ module axim2s_tb;
             check(desc[63:2] == addr[63:2], "CQ address mismatch");
             check(desc[74:64] == beats*8, "CQ DW count mismatch");
             check(desc[1:0] == txn[1:0], "CQ address type mismatch");
-            check(desc[103:96] == (is_write ? 8'h40+txn : 8'h80+txn), "CQ Tag mismatch");
+            expected_tag[7:0] = is_write ? 8'h40+txn : 8'h80+txn;
+            expected_tag[9:8] = txn[1:0];
+            check({desc[127], desc[79], desc[103:96]} === expected_tag,
+                  "CQ 10-bit Tag mismatch");
             check(desc[95:80] == (is_write ? 16'h1200+txn : 16'h3400+txn), "CQ Requester ID mismatch");
             check(desc[111:104] == expected_function, "CQ target function mismatch");
             check(desc[114:112] == ((txn + (is_write ? 1 : 2)) & 3'h7), "CQ traffic type mismatch");
@@ -253,19 +264,21 @@ module axim2s_tb;
         integer lane, index;
         reg [255:0] expected_data;
         begin
-            for (beat = 0; beat <= beats; beat = beat + 1) begin
+            for (beat = 0; beat < beats; beat = beat + 1) begin
                 expected_data = 0;
                 for (lane = 0; lane < 8; lane = lane + 1) begin
-                    index = beat*8 + lane - 1;
+                    index = beat*8 + lane + 4;
                     if (index >= 0 && index < beats*8)
                         expected_data[lane*32 +: 32] = payload_dw(txn, index);
                 end
                 do @(posedge aclk); while (!(axis_cq_tvalid && axis_cq_tready));
                 check(axis_cq_tdata === expected_data, "CQ write payload mismatch");
-                check(axis_cq_tkeep == (beat == beats ? 8'h01 : 8'hff), "CQ payload keep mismatch");
-                check(axis_cq_tuser[39:8] == (beat == 0 ? 32'hffff_fff0 :
-                      beat == beats ? 32'h0000_000f : 32'hffff_ffff), "CQ payload byte enable mismatch");
-                check(axis_cq_tlast == (beat == beats), "CQ payload tlast mismatch");
+                check(axis_cq_tkeep == (beat == beats-1 ? 8'h0f : 8'hff), "CQ payload keep mismatch");
+                check(axis_cq_tuser[39:8] == (beat == beats-1 ? 32'h0000_ffff :
+                      32'hffff_ffff), "CQ payload byte enable mismatch");
+                check(axis_cq_tuser[7:0] == 0 && !axis_cq_tuser[40],
+                      "CQ continuation must clear First/Last BE and SOP");
+                check(axis_cq_tlast == (beat == beats-1), "CQ payload tlast mismatch");
             end
         end
     endtask
@@ -347,6 +360,7 @@ module axim2s_tb;
             desc = '0;
             desc[6:0] = addr[6:0] + start_dw*4;
             desc[28:16] = total_beats*32 - start_dw*4;
+            desc[31:30] = txn[1:0]; // Tag[9:8]
             desc[42:32] = count_dw;
             desc[45:43] = status;
             desc[46] = poison;
@@ -575,20 +589,56 @@ module axim2s_tb;
         end
     endtask
 
+    task automatic check_cc_tag_extension;
+        reg [255:0] desc;
+        reg [63:0] addr;
+        integer txn, mismatch;
+        begin
+            $display("CC 10-bit Tag: reject completions differing only in Tag[9:8]");
+            for (txn = 44; txn < 48; txn = txn + 1) begin
+                addr = 64'h14000 + txn*32;
+                queue_read(txn, 2, addr);
+                for (mismatch = 1; mismatch < 4; mismatch = mismatch + 1) begin
+                    desc = '0;
+                    desc[6:0] = addr[6:0];
+                    desc[28:16] = 13'd64;
+                    desc[31:30] = txn[1:0] ^ mismatch[1:0];
+                    desc[42:32] = 11'd8;
+                    desc[63:48] = 16'h3400 + txn;
+                    desc[71:64] = 8'h80 + txn;
+                    // Exercise both multi-beat SC and single-beat UR drops.
+                    if (mismatch == 2) begin
+                        desc[42:32] = 0;
+                        desc[45:43] = 3'b001;
+                    end
+                    send_cc_beat(desc, 8'h07, mismatch == 2, 0);
+                    if (mismatch != 2)
+                        send_cc_beat(256'b0, 8'hff, 1'b1, 0);
+                    if (mstr_rvalid || !axis_cc_tready)
+                        $fatal(1, "CC with mismatched Tag[9:8] satisfied the read");
+                end
+                // The pending request must still accept matching split packets.
+                send_completion(txn, 2, addr, 0, 8, 3'b000, 1'b0);
+                send_completion(txn, 2, addr, 8, 8, 3'b000, 1'b0);
+                collect_r(txn, 2, 2'b00, 3'b000, 1'b0, 0);
+            end
+        end
+    endtask
+
     // Transaction logger.  Each entry is emitted only for a valid handshake.
     always @(posedge aclk) begin
         if (aresetn) begin
             if (mstr_awvalid && mstr_awready)
-                $fdisplay(log_fd, "%0t AXI_AW id=%0d addr=%h beats=%0d tag=%02h requester=%04h function=%0d",
+                $fdisplay(log_fd, "%0t AXI_AW id=%0d addr=%h beats=%0d tag=%03h requester=%04h function=%0d",
                           $time, mstr_awid, mstr_awaddr, mstr_awlen+1,
-                          mstr_awmisc_info[47:40], mstr_awmisc_info[39:24],
+                          mstr_awmisc_info[49:40], mstr_awmisc_info[39:24],
                           mstr_awmisc_info_vfunc_active ? 8+mstr_awmisc_info_vfunc_num : mstr_awmisc_info_func_num);
             if (mstr_wvalid && mstr_wready)
                 $fdisplay(log_fd, "%0t AXI_W last=%0b strb=%h data=%h", $time, mstr_wlast, mstr_wstrb, mstr_wdata);
             if (mstr_arvalid && mstr_arready)
-                $fdisplay(log_fd, "%0t AXI_AR id=%0d addr=%h beats=%0d tag=%02h requester=%04h function=%0d",
+                $fdisplay(log_fd, "%0t AXI_AR id=%0d addr=%h beats=%0d tag=%03h requester=%04h function=%0d",
                           $time, mstr_arid, mstr_araddr, mstr_arlen+1,
-                          mstr_armisc_info[47:40], mstr_armisc_info[39:24],
+                          mstr_armisc_info[49:40], mstr_armisc_info[39:24],
                           mstr_armisc_info_vfunc_active ? 8+mstr_armisc_info_vfunc_num : mstr_armisc_info_func_num);
             if (mstr_bvalid && mstr_bready)
                 $fdisplay(log_fd, "%0t AXI_B id=%0d resp=%0d pcie_status=%0d", $time, mstr_bid, mstr_bresp, mstr_bmisc_info_cpl_stat);
@@ -597,10 +647,11 @@ module axim2s_tb;
                           $time, mstr_rid, mstr_rresp, mstr_rmisc_info_cpl_stat, mstr_rmisc_info[7], mstr_rlast, mstr_rdata);
             if (axis_cq_tvalid && axis_cq_tready) begin
                 if (!cq_in_packet)
-                    $fdisplay(log_fd, "%0t CQ_DESC type=%s addr=%h dw_count=%0d requester=%04h tag=%02h function=%0d tc=%0d attr=%0d ats=%0d last=%0b",
+                    $fdisplay(log_fd, "%0t CQ_DESC type=%s addr=%h dw_count=%0d requester=%04h tag=%03h function=%0d tc=%0d attr=%0d ats=%0d last=%0b",
                               $time, axis_cq_tdata[78:75] == 4'b0001 ? "Memory Write" : "Memory Read",
                               {axis_cq_tdata[63:2],2'b00}, axis_cq_tdata[74:64], axis_cq_tdata[95:80],
-                              axis_cq_tdata[103:96], axis_cq_tdata[111:104], axis_cq_tdata[123:121],
+                              {axis_cq_tdata[127], axis_cq_tdata[79], axis_cq_tdata[103:96]},
+                              axis_cq_tdata[111:104], axis_cq_tdata[123:121],
                               axis_cq_tdata[126:124], axis_cq_tdata[1:0], axis_cq_tlast);
                 else
                     $fdisplay(log_fd, "%0t CQ_PAYLOAD keep=%h byte_enable=%h last=%0b data=%h",
@@ -609,9 +660,10 @@ module axim2s_tb;
             end
             if (axis_cc_tvalid && axis_cc_tready) begin
                 if (!cc_in_packet)
-                    $fdisplay(log_fd, "%0t CC_DESC type=Completion lower_addr=%0d byte_count=%0d dw_count=%0d status=%0d requester=%04h tag=%02h poison=%0b last=%0b",
+                    $fdisplay(log_fd, "%0t CC_DESC type=Completion lower_addr=%0d byte_count=%0d dw_count=%0d status=%0d requester=%04h tag=%03h poison=%0b last=%0b",
                               $time, axis_cc_tdata[6:0], axis_cc_tdata[28:16], axis_cc_tdata[42:32],
-                              axis_cc_tdata[45:43], axis_cc_tdata[63:48], axis_cc_tdata[71:64],
+                              axis_cc_tdata[45:43], axis_cc_tdata[63:48],
+                              {axis_cc_tdata[31:30], axis_cc_tdata[71:64]},
                               axis_cc_tdata[46], axis_cc_tlast);
                 else
                     $fdisplay(log_fd, "%0t CC_PAYLOAD keep=%h last=%0b data=%h", $time, axis_cc_tkeep, axis_cc_tlast, axis_cc_tdata);
@@ -768,6 +820,7 @@ module axim2s_tb;
         end
 
         check_cq_cc_independence();
+        check_cc_tag_extension();
 
         repeat (5) @(posedge aclk);
         check(read_cq_stall_cycles > 0, "Memory Read CQ backpressure was not exercised");

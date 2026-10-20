@@ -113,7 +113,7 @@ module axim2s
 
 );
 
-// First implementation: 256-bit, address-aligned, full-width INCR bursts.
+// 256-bit CQ Dword-aligned packets, full-width AXI INCR bursts.
 // All counters below count AXI beats or Dwords, never encoded LEN values.
 localparam [3:0] ST_IDLE = 0, ST_WRITE = 1, ST_CQ_HEAD = 2,
                  ST_CQ_DATA = 3, ST_CC_HEAD = 4, ST_CC_DATA = 5,
@@ -207,21 +207,21 @@ always @* begin
     source_dw = 0;
     if (cq_state == ST_CQ_HEAD) begin
         cq_data[127:0] = request_write ? request_descriptor : read_descriptor;
-        // Padding to the next beat is valid keep, but not payload byte_en.
-        cq_keep = request_write ? 8'hff : 8'h0f;
+        cq_keep = 8'h0f;
         cq_user[7:0] = request_write ? {request_last_be, request_first_be} :
                                          {read_last_be, read_first_be};
         cq_user[40] = 1'b1;
         cq_user[42] = request_write ? request_tph[0] : read_tph[0];
         cq_user[44:43] = request_write ? request_tph[2:1] : read_tph[2:1];
         cq_user[52:45] = request_write ? request_tph[10:3] : read_tph[10:3];
-    end else if (cq_state == ST_CQ_DATA) begin
-        // The first payload beat reserves lane 0; subsequent beats use all lanes.
+    end
+    if (request_write &&
+        (cq_state == ST_CQ_HEAD || cq_state == ST_CQ_DATA)) begin
+        // The descriptor occupies lanes 0..3; payload starts in lane 4.
+        // Continuation beats carry payload from lane 0 without padding.
         // Read only payload Dwords, skipping the AXI address-alignment padding.
-        if (send_dw == 0)
-            cq_keep[0] = 1'b1;
         for (keep_lane = 0; keep_lane < 8; keep_lane = keep_lane + 1) begin
-            if ((send_dw != 0 || keep_lane != 0) &&
+            if ((cq_state == ST_CQ_DATA || keep_lane >= 4) &&
                 send_dw + cq_payload_dw < request_dw) begin
                 source_dw = {6'b0, request_byte_lane[4:2]} +
                             send_dw + cq_payload_dw;
@@ -240,7 +240,8 @@ assign axis_cq_tkeep = cq_keep;
 assign axis_cq_tuser = cq_user;
 assign axis_cq_tvalid = cq_state == ST_CQ_HEAD || cq_state == ST_CQ_DATA;
 assign axis_cq_tlast = (cq_state == ST_CQ_HEAD && !request_write) ||
-                       (cq_state == ST_CQ_DATA &&
+                       (request_write &&
+                        (cq_state == ST_CQ_HEAD || cq_state == ST_CQ_DATA) &&
                         send_dw + cq_payload_dw == request_dw);
 assign axis_cc_tready = read_state == ST_CC_HEAD || read_state == ST_CC_DATA ||
                         read_state == ST_CC_DROP;
@@ -295,7 +296,10 @@ always @* begin
         end
     end
 end
-wire cc_identity_match = axis_cc_tdata[71:64] == read_descriptor[103:96] &&
+// CC[30]/[31] carry Tag[8]/[9], matching the saved CQ extension bits.
+wire cc_identity_match = {axis_cc_tdata[31:30], axis_cc_tdata[71:64]} ==
+                         {read_descriptor[127], read_descriptor[79],
+                          read_descriptor[103:96]} &&
                          axis_cc_tdata[63:48] == read_descriptor[95:80];
 wire [12:0] expected_byte_count =
             (({4'b0, read_dw} - {4'b0, received_dw}) << 2) -
@@ -333,6 +337,7 @@ always @* begin
     aw_descriptor[1:0] = mstr_awmisc_info_ats;
     aw_descriptor[63:2] = mstr_awaddr[63:2];
     aw_descriptor[78:75] = 4'b0001;
+    aw_descriptor[79] = mstr_awmisc_info[48]; // Tag[8]
     aw_descriptor[95:80] = mstr_awmisc_info[39:24];
     aw_descriptor[103:96] = mstr_awmisc_info[47:40];
     aw_descriptor[111:104] = aw_function;
@@ -340,12 +345,14 @@ always @* begin
                              3'd6 : mstr_awmisc_info[8:6];
     aw_descriptor[123:121] = mstr_awmisc_info[18:16];
     aw_descriptor[126:124] = {mstr_awmisc_info_ido, mstr_awmisc_info[15:14]};
+    aw_descriptor[127] = mstr_awmisc_info[49]; // Tag[9]
 
     ar_descriptor = 128'b0;
     ar_descriptor[1:0] = mstr_armisc_info_ats;
     ar_descriptor[63:2] = mstr_araddr[63:2];
     ar_descriptor[74:64] = {2'b0, ar_dw_count};
     ar_descriptor[78:75] = 4'b0000;
+    ar_descriptor[79] = mstr_armisc_info[48]; // Tag[8]
     ar_descriptor[95:80] = mstr_armisc_info[39:24];
     ar_descriptor[103:96] = mstr_armisc_info[47:40];
     ar_descriptor[111:104] = ar_function;
@@ -353,6 +360,7 @@ always @* begin
                              3'd6 : mstr_armisc_info[8:6];
     ar_descriptor[123:121] = mstr_armisc_info[18:16];
     ar_descriptor[126:124] = {mstr_armisc_info_ido, mstr_armisc_info[15:14]};
+    ar_descriptor[127] = mstr_armisc_info[49]; // Tag[9]
 end
 
 always @* begin
@@ -440,9 +448,13 @@ always @(posedge aclk or negedge aresetn) begin
             end
             ST_CQ_HEAD: begin
                 if (cq_fire) begin
-                    cq_state <= request_write ? ST_CQ_DATA : ST_IDLE;
-                    if (!request_write)
-                        prefer_read <= 0;
+                    if (axis_cq_tlast) begin
+                        cq_state <= ST_IDLE;
+                        prefer_read <= request_write;
+                    end else begin
+                        cq_state <= ST_CQ_DATA;
+                        send_dw <= send_dw + cq_payload_dw;
+                    end
                 end
             end
             ST_CQ_DATA: begin
@@ -483,7 +495,7 @@ always @(posedge aclk or negedge aresetn) begin
             end
             ST_CQ_HEAD: begin
                 if (cq_fire && request_write && cq_state == ST_CQ_HEAD)
-                    write_state <= ST_CQ_DATA;
+                    write_state <= axis_cq_tlast ? ST_B : ST_CQ_DATA;
             end
             ST_CQ_DATA: begin
                 if (cq_fire && axis_cq_tlast)
