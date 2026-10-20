@@ -97,6 +97,10 @@ module axim2s_tb;
     integer axi_txn = 0;
     integer random_seed;
     integer regression_index;
+    integer read_cq_stall_cycles = 0;
+    integer cq_cc_overlap_cycles = 0;
+    integer aw_ar_overlap_cycles = 0;
+    integer cq_ready_mode = -1;
     reg cq_in_packet = 1'b0;
     reg cc_in_packet = 1'b0;
 
@@ -208,7 +212,11 @@ module axim2s_tb;
             desc = axis_cq_tdata[127:0];
             expected_function = use_vf ? (8 + txn + (is_write ? 3 : 5)) : txn[2:0];
             expected_tph = (is_write ? 11'h155 : 11'h2aa) ^ txn;
-            check(axis_cq_tkeep == 8'h0f, "CQ descriptor keep must mark four descriptor DWs");
+            check(axis_cq_tkeep == (is_write ? 8'hff : 8'h0f),
+                  "CQ descriptor keep mismatch");
+            check(axis_cq_tdata[255:128] === 128'b0, "CQ descriptor upper lanes mismatch");
+            check(axis_cq_tuser[39:8] === 32'b0, "CQ descriptor payload byte enables must be zero");
+            check(axis_cq_tuser[41] === 1'b0, "CQ descriptor discontinue must be zero");
             check(axis_cq_tuser[40], "CQ descriptor must assert SOP");
             check(axis_cq_tuser[7:0] == 8'hff, "CQ first/last byte enable mismatch");
             check({axis_cq_tuser[52:45], axis_cq_tuser[44:43], axis_cq_tuser[42]} == expected_tph,
@@ -227,14 +235,14 @@ module axim2s_tb;
         end
     endtask
 
-    task automatic check_simultaneous_grant(input bit expect_read);
+    task automatic check_independent_address_slots;
         begin
             @(negedge aclk);
             mstr_awvalid = 1'b1;
             mstr_arvalid = 1'b1;
             #1;
-            check(mstr_awready == !expect_read, "simultaneous AW/AR write grant mismatch");
-            check(mstr_arready == expect_read, "simultaneous AW/AR read grant mismatch");
+            check(mstr_awready, "idle write slot blocked by AR");
+            check(mstr_arready, "idle read slot blocked by AW");
             mstr_awvalid = 1'b0;
             mstr_arvalid = 1'b0;
         end
@@ -242,13 +250,22 @@ module axim2s_tb;
 
     task automatic expect_cq_write_data(input integer txn, input integer beats);
         integer beat;
+        integer lane, index;
+        reg [255:0] expected_data;
         begin
-            for (beat = 0; beat < beats; beat = beat + 1) begin
+            for (beat = 0; beat <= beats; beat = beat + 1) begin
+                expected_data = 0;
+                for (lane = 0; lane < 8; lane = lane + 1) begin
+                    index = beat*8 + lane - 1;
+                    if (index >= 0 && index < beats*8)
+                        expected_data[lane*32 +: 32] = payload_dw(txn, index);
+                end
                 do @(posedge aclk); while (!(axis_cq_tvalid && axis_cq_tready));
-                check(axis_cq_tdata === payload_beat(txn, beat), "CQ write payload mismatch");
-                check(axis_cq_tkeep == 8'hff, "CQ payload keep mismatch");
-                check(axis_cq_tuser[39:8] == 32'hffff_ffff, "CQ payload byte enable mismatch");
-                check(axis_cq_tlast == (beat == beats-1), "CQ payload tlast mismatch");
+                check(axis_cq_tdata === expected_data, "CQ write payload mismatch");
+                check(axis_cq_tkeep == (beat == beats ? 8'h01 : 8'hff), "CQ payload keep mismatch");
+                check(axis_cq_tuser[39:8] == (beat == 0 ? 32'hffff_fff0 :
+                      beat == beats ? 32'h0000_000f : 32'hffff_ffff), "CQ payload byte enable mismatch");
+                check(axis_cq_tlast == (beat == beats), "CQ payload tlast mismatch");
             end
         end
     endtask
@@ -317,6 +334,7 @@ module axim2s_tb;
     endtask
 
     task automatic send_completion(input integer txn, input integer total_beats,
+                                    input [63:0] addr,
                                     input integer start_dw, input integer count_dw,
                                     input [2:0] status, input bit poison);
         reg [255:0] desc;
@@ -327,7 +345,7 @@ module axim2s_tb;
         integer this_dw;
         begin
             desc = '0;
-            desc[6:0] = start_dw*4;
+            desc[6:0] = addr[6:0] + start_dw*4;
             desc[28:16] = total_beats*32 - start_dw*4;
             desc[42:32] = count_dw;
             desc[45:43] = status;
@@ -356,7 +374,8 @@ module axim2s_tb;
     task automatic collect_r(input integer txn, input integer beats,
                              input [1:0] expected_resp,
                              input [2:0] expected_status,
-                             input bit expected_poison);
+                             input bit expected_poison,
+                             input integer poison_dw);
         integer beat;
         integer stall;
         begin
@@ -368,7 +387,9 @@ module axim2s_tb;
                 check(mstr_rid == txn[ID_W-1:0], "R ID mismatch");
                 check(mstr_rresp == expected_resp, "R response mismatch");
                 check(mstr_rmisc_info_cpl_stat == expected_status, "R completion status mismatch");
-                check(mstr_rmisc_info[7] == expected_poison, "R poison flag mismatch");
+                check(mstr_rmisc_info[7] ==
+                      (expected_poison && beat*8 < poison_dw),
+                      "R poison flag mismatch");
                 check(mstr_rlast == (beat == beats-1), "R last mismatch");
                 if (expected_resp == 2'b00)
                     check(mstr_rdata === payload_beat(txn, beat), "R payload mismatch");
@@ -391,12 +412,143 @@ module axim2s_tb;
                 expect_cq_header(1'b0, txn, beats, addr, use_vf);
             join
             if (split_dw > 0 && split_dw < total_dw) begin
-                send_completion(txn, beats, 0, split_dw, 3'b000, poison);
-                send_completion(txn, beats, split_dw, total_dw-split_dw, 3'b000, 1'b0);
+                send_completion(txn, beats, addr, 0, split_dw, 3'b000, poison);
+                send_completion(txn, beats, addr, split_dw, total_dw-split_dw, 3'b000, 1'b0);
             end else begin
-                send_completion(txn, beats, 0, total_dw, 3'b000, poison);
+                send_completion(txn, beats, addr, 0, total_dw, 3'b000, poison);
             end
-            collect_r(txn, beats, 2'b00, 3'b000, poison);
+            collect_r(txn, beats, 2'b00, 3'b000, poison,
+                      (split_dw > 0 && split_dw < total_dw) ? split_dw : total_dw);
+        end
+    endtask
+
+    task automatic queue_read(input integer txn, input integer beats,
+                               input [63:0] addr);
+        begin
+            fork
+                drive_ar(txn, beats, addr, 1'b0);
+                expect_cq_header(1'b0, txn, beats, addr, 1'b0);
+            join
+        end
+    endtask
+
+    task automatic check_cq_cc_independence;
+        integer n;
+        reg [63:0] addr;
+        begin
+            $display("CQ/CC INDEPENDENCE: CC progresses with CQ stalled");
+            queue_read(20, 4, 64'h2000);
+            cq_ready_mode = 0;
+            fork
+                run_write(21, 4, 64'h3000, 1'b0, 1'b0);
+                begin
+                    do @(posedge aclk); while (!axis_cq_tvalid);
+                    check(!axis_cq_tready, "CQ stall was not applied");
+                    send_completion(20, 4, 64'h2000, 0, 32, 3'b000, 1'b0);
+                    collect_r(20, 4, 2'b00, 3'b000, 1'b0, 0);
+                    check(axis_cq_tvalid && !axis_cq_tready,
+                          "CQ was not held while CC/R progressed");
+                    cq_ready_mode = 1;
+                end
+            join
+
+            $display("CQ/CC INDEPENDENCE: B stall permits read CQ and CC");
+            fork
+                drive_aw(22, 2, 64'h4000, 0, 1'b0);
+                drive_w(22, 2, 2, 1'b1);
+                begin
+                    expect_cq_header(1'b1, 22, 2, 64'h4000, 1'b0);
+                    expect_cq_write_data(22, 2);
+                end
+            join
+            do @(posedge aclk); while (!mstr_bvalid);
+            run_read(23, 2, 64'h5000, 8, 1'b0, 1'b1);
+            check(mstr_bvalid && mstr_bid == 22, "B context changed during read");
+            finish_b(22, 0);
+
+            $display("CQ/CC INDEPENDENCE: R stall permits write CQ");
+            queue_read(24, 2, 64'h6000);
+            send_completion(24, 2, 64'h6000, 0, 16, 3'b000, 1'b0);
+            do @(posedge aclk); while (!mstr_rvalid);
+            run_write(25, 3, 64'h7000, 1'b1, 1'b0);
+            check(mstr_rvalid && mstr_rid == 24, "R context changed during write");
+            collect_r(24, 2, 2'b00, 3'b000, 1'b0, 0);
+
+            $display("CQ/CC INDEPENDENCE: W-first slot does not block reads");
+            drive_w(26, 1, 0, 1'b0);
+            run_read(27, 1, 64'h8000, 0, 1'b0, 1'b0);
+            fork
+                drive_aw(26, 1, 64'h9000, 0, 1'b0);
+                begin
+                    expect_cq_header(1'b1, 26, 1, 64'h9000, 1'b0);
+                    expect_cq_write_data(26, 1);
+                end
+            join
+            finish_b(26, 0);
+
+            $display("CQ/CC INDEPENDENCE: simultaneous CQ/CC handshakes");
+            for (n = 0; n < 3; n = n + 1) begin
+                addr = 64'ha000 + ($urandom_range(0, 31) << 5);
+                queue_read(28 + n*2, 8, addr);
+                fork
+                    run_write(29 + n*2, 8, addr + 64'h1000, 1'b0, 1'b0);
+                    begin
+                        do @(posedge aclk); while (!(axis_cq_tvalid && axis_cq_tuser[40]));
+                        send_completion(28 + n*2, 8, addr, 0, 64, 3'b000, 1'b0);
+                        collect_r(28 + n*2, 8, 2'b00, 3'b000, 1'b0, 0);
+                    end
+                join
+            end
+            $display("CQ/CC INDEPENDENCE: simultaneous AW/AR capture and split CC");
+            fork
+                drive_aw(34, 4, 64'hc000, 0, 1'b1);
+                drive_w(34, 4, 2, 1'b1);
+                drive_ar(35, 2, 64'hd000, 1'b0);
+                begin
+                    expect_cq_header(1'b0, 35, 2, 64'hd000, 1'b0);
+                    expect_cq_header(1'b1, 34, 4, 64'hc000, 1'b1);
+                    expect_cq_write_data(34, 4);
+                end
+                begin
+                    do @(posedge aclk); while (!(axis_cq_tvalid && axis_cq_tready &&
+                                                 axis_cq_tdata[78:75] == 4'b0000));
+                    send_completion(35, 2, 64'hd000, 0, 8, 3'b000, 1'b1);
+                    send_completion(35, 2, 64'hd000, 8, 8, 3'b000, 1'b0);
+                    collect_r(35, 2, 2'b00, 3'b000, 1'b1, 8);
+                end
+            join
+            finish_b(34, 0);
+            check(aw_ar_overlap_cycles > 0, "simultaneous AW/AR handshakes were not exercised");
+
+            $display("CQ/CC INDEPENDENCE: CC error does not abort CQ write");
+            queue_read(36, 2, 64'he000);
+            fork
+                run_write(37, 4, 64'hf000, 1'b0, 1'b0);
+                begin
+                    do @(posedge aclk); while (!(axis_cq_tvalid && axis_cq_tuser[40]));
+                    send_completion(36, 2, 64'he000, 0, 0, 3'b001, 1'b0);
+                    collect_r(36, 2, 2'b11, 3'b001, 1'b0, 0);
+                end
+            join
+
+            // Reset with a read awaiting CC and a write blocked on CQ.
+            queue_read(38, 1, 64'h10000);
+            cq_ready_mode = 0;
+            fork
+                drive_aw(39, 2, 64'h11000, 0, 1'b0);
+                drive_w(39, 2, 2, 1'b1);
+            join
+            do @(negedge aclk); while (!axis_cq_tvalid);
+            reset_dut();
+            check(!axis_cq_tvalid && !axis_cc_tready && !mstr_bvalid && !mstr_rvalid,
+                  "reset retained concurrent request context");
+            check(mstr_awready && mstr_arready, "reset did not release both address slots");
+            cq_ready_mode = 1;
+            run_write(40, 1, 64'h12000, 1'b0, 1'b0);
+            run_read(41, 1, 64'h13000, 0, 1'b0, 1'b0);
+            check(cq_cc_overlap_cycles > 0, "CQ/CC simultaneous handshakes were not exercised");
+            $display("CQ/CC simultaneous handshake cycles: %0d", cq_cc_overlap_cycles);
+            cq_ready_mode = -1;
         end
     endtask
 
@@ -409,8 +561,8 @@ module axim2s_tb;
                 drive_ar(txn, 1, addr, 1'b0);
                 expect_cq_header(1'b0, txn, 1, addr, 1'b0);
             join
-            send_completion(txn, 1, 0, 0, status, 1'b0);
-            collect_r(txn, 1, response, status, 1'b0);
+            send_completion(txn, 1, addr, 0, 0, status, 1'b0);
+            collect_r(txn, 1, response, status, 1'b0, 0);
         end
     endtask
 
@@ -493,6 +645,13 @@ module axim2s_tb;
             b_stalled <= 1'b0;
             r_stalled <= 1'b0;
         end else begin
+            if (mstr_awvalid && mstr_awready && mstr_arvalid && mstr_arready)
+                aw_ar_overlap_cycles = aw_ar_overlap_cycles + 1;
+            if (axis_cq_tvalid && axis_cq_tready && axis_cc_tvalid && axis_cc_tready)
+                cq_cc_overlap_cycles = cq_cc_overlap_cycles + 1;
+            if (axis_cq_tvalid && !axis_cq_tready &&
+                !cq_in_packet && axis_cq_tdata[78:75] == 4'b0000)
+                read_cq_stall_cycles = read_cq_stall_cycles + 1;
             if (cq_stalled)
                 check(axis_cq_tvalid && axis_cq_tdata === cq_hold_data &&
                       axis_cq_tkeep === cq_hold_keep && axis_cq_tlast === cq_hold_last &&
@@ -529,7 +688,7 @@ module axim2s_tb;
         if (!aresetn)
             axis_cq_tready <= 1'b0;
         else
-            axis_cq_tready <= $urandom_range(0, 1);
+            axis_cq_tready <= cq_ready_mode < 0 ? $urandom_range(0, 1) : cq_ready_mode;
     end
 
     initial begin
@@ -576,7 +735,7 @@ module axim2s_tb;
         fork
             drive_aw(7, 3, 64'h0000_0000_7000_0000, 0, 1'b0);
             begin
-                @(posedge mstr_wready);
+                wait (mstr_wready);
                 @(negedge aclk);
                 mstr_wdata = payload_beat(7, 0);
                 mstr_wvalid = 1'b1;
@@ -590,13 +749,13 @@ module axim2s_tb;
         @(negedge aclk); aresetn = 1'b1;
         repeat (2) @(posedge aclk);
         run_write(8, 2, 64'h0000_0000_8000_0000, 1'b0, 1'b0);
-        check_simultaneous_grant(1'b1);
+        check_independent_address_slots();
 
         // Small randomized regression with several transactions per case.
         run_write(9, $urandom_range(1, 6), 64'h0000_0000_9000_0000 + ($urandom_range(0,31) << 5), 1'b1, 1'b1);
-        check_simultaneous_grant(1'b1);
+        check_independent_address_slots();
         run_read(10, 2, 64'h0000_0000_a000_0000 + ($urandom_range(0,31) << 5), 8, 1'b0, 1'b0);
-        check_simultaneous_grant(1'b0);
+        check_independent_address_slots();
         for (regression_index = 11; regression_index < 17; regression_index = regression_index + 1) begin
             if (regression_index[0])
                 run_write(regression_index, $urandom_range(1, 6),
@@ -608,7 +767,11 @@ module axim2s_tb;
                          0, $urandom_range(0,1), $urandom_range(0,1));
         end
 
+        check_cq_cc_independence();
+
         repeat (5) @(posedge aclk);
+        check(read_cq_stall_cycles > 0, "Memory Read CQ backpressure was not exercised");
+        $display("Memory Read CQ stalled cycles checked: %0d", read_cq_stall_cycles);
         $fclose(log_fd);
         if (errors == 0) begin
             $display("TEST PASSED");
